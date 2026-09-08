@@ -1,0 +1,41 @@
+name: Hourly Agent Performance Detail Report
+
+on:
+  schedule:
+    # Runs at minute 5 of every hour (UTC). GitHub's cron scheduler can lag
+    # a few minutes during high load, so avoid minute 0 for reliability.
+    - cron: "5 * * * *"
+  # Lets you trigger it manually from the Actions tab to test without waiting
+  workflow_dispatch: {}
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run report script
+        env:
+          VICI_SERVER: ${{ secrets.VICI_SERVER }}
+          VICI_API_USER: ${{ secrets.VICI_API_USER }}
+          VICI_API_PASS: ${{ secrets.VICI_API_PASS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # Optional overrides — remove or edit as needed:
+          # REPORT_HOURS_BACK: "1"
+          # VICI_CAMPAIGN_ID: "MYCAMP"
+        run: python vici_report.py
