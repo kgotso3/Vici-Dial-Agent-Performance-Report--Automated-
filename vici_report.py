@@ -2,40 +2,59 @@
 """
 vici_report.py
 
-Pulls agent performance data from ViciDial (the same data shown on the
-"Agent Performance Detail" report under Agent Reports) via the built-in
-non_agent_api.php 'agent_stats_export' function, saves it as an .xlsx
-file, and emails it as an attachment.
+Pulls Cartrack's custom "Agent Performance Detail" report directly from
+its ViciDial admin page:
 
-Designed to run unattended on a schedule (see .github/workflows/hourly_report.yml).
-All secrets are read from environment variables — never hardcode credentials.
+    https://vicidial-debt-web-ndf.cartrack.com/vicidial/AST_agent_performance_detail.php
+
+This page is protected by HTTP Basic Authentication (the native browser
+sign-in popup), so the script authenticates the same way — sending a
+username/password with the request, no login form or session cookies
+needed.
+
+The report itself is returned as an unusually-encoded CSV: each row is a
+single outer-quoted CSV field, which itself contains a second, normal
+comma-separated row. The script unwraps this twice to get clean data.
+
+Once parsed, the data is saved as an .xlsx file and emailed as an
+attachment. Designed to run unattended on a schedule (see
+.github/workflows/hourly_report.yml). All secrets are read from
+environment variables — never hardcode credentials.
 
 Required environment variables:
-    VICI_SERVER        e.g. "https://your-vicidial-server.example.com"
-    VICI_API_USER       ViciDial user with 'view reports' permission + API access
-    VICI_API_PASS
-    SMTP_HOST           e.g. "smtp.gmail.com"
-    SMTP_PORT           e.g. "587"
+    VICI_SERVER          e.g. "https://vicidial-debt-web-ndf.cartrack.com"
+    VICI_API_USER        the HTTP Basic Auth username (same one used in the
+                          browser sign-in popup, e.g. "9952")
+    VICI_API_PASS         the matching HTTP Basic Auth password
+    SMTP_HOST            e.g. "smtp.office365.com"
+    SMTP_PORT            e.g. "587"
     SMTP_USER
     SMTP_PASS
     EMAIL_FROM
-    EMAIL_TO             comma-separated list of recipients
+    EMAIL_TO              comma-separated list of recipients
 
 Optional environment variables:
-    REPORT_HOURS_BACK   how many hours back the report window should cover (default: 1)
-    VICI_CAMPAIGN_ID    restrict to one campaign (optional)
-    VICI_AGENT_USER     restrict to one agent (optional)
+    REPORT_HOURS_BACK    how many hours back the report window should cover
+                          (default: 1)
+    VICI_TIMEZONE        IANA timezone name for the report's date/time
+                          window (default: "Africa/Johannesburg"). This
+                          should match the timezone ViciDial itself uses,
+                          NOT the timezone GitHub Actions runs in (which is
+                          always UTC).
 """
 
 import os
 import sys
 import io
+import csv
 import smtplib
 import ssl
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo
 
 import requests
+from requests.auth import HTTPBasicAuth
 import pandas as pd
 
 
@@ -63,108 +82,137 @@ EMAIL_FROM = get_required_env("EMAIL_FROM")
 EMAIL_TO = [addr.strip() for addr in get_required_env("EMAIL_TO").split(",")]
 
 REPORT_HOURS_BACK = int(os.environ.get("REPORT_HOURS_BACK", "1"))
-VICI_CAMPAIGN_ID = os.environ.get("VICI_CAMPAIGN_ID", "")
-VICI_AGENT_USER = os.environ.get("VICI_AGENT_USER", "")
+VICI_TZ = ZoneInfo(os.environ.get("VICI_TIMEZONE", "Africa/Johannesburg"))
 
-# NOTE: we no longer hardcode a column list. We ask ViciDial itself for a
-# header row (header=YES below) and use whatever column names it returns.
-# This is more robust across ViciDial versions than guessing a fixed layout.
+REPORT_PATH = "/vicidial/AST_agent_performance_detail.php"
 
 
 # --------------------------------------------------------------------------
-# Step 1: Pull data from the ViciDial API
+# Step 1: Download the report from ViciDial
 # --------------------------------------------------------------------------
 
-def fetch_agent_performance():
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=REPORT_HOURS_BACK)
+def download_report_text() -> tuple[str, str, str]:
+    """Downloads the raw report CSV text for the last REPORT_HOURS_BACK hours."""
+    now_local = datetime.now(VICI_TZ)
+    start_local = now_local - timedelta(hours=REPORT_HOURS_BACK)
 
-    # ViciDial expects "YYYY-MM-DD+HH:MM:SS" in the site's local server time.
-    # If your ViciDial server is not on UTC, adjust here accordingly (e.g.
-    # convert to the server's timezone before formatting).
-    dt_start = start.strftime("%Y-%m-%d+%H:%M:%S")
-    dt_end = now.strftime("%Y-%m-%d+%H:%M:%S")
+    query_date = start_local.strftime("%Y-%m-%d")
+    query_time = start_local.strftime("%H:%M:%S")
+    end_date = now_local.strftime("%Y-%m-%d")
+    end_time = now_local.strftime("%H:%M:%S")
 
+    # "--ALL--" tells ViciDial to include every campaign/group/agent,
+    # rather than us having to hardcode and maintain a list that will
+    # drift out of date as campaigns are added or removed.
     params = {
-        "source": "hourly_report",
-        "user": VICI_API_USER,
-        "pass": VICI_API_PASS,
-        "function": "agent_stats_export",
-        "datetime_start": dt_start,
-        "datetime_end": dt_end,
-        "stage": "pipe",
-        "header": "YES",  # ask ViciDial to tell us its own column names
-        "time_format": "M",  # minutes, easy to sort/format later
+        "DB": "0",
+        "query_date": query_date,
+        "query_time": query_time,
+        "end_date": end_date,
+        "end_time": end_time,
+        "group[]": "--ALL--",
+        "user_group[]": "--ALL--",
+        "users[]": "--ALL--",
+        "report_display_type": "TEXT",
+        "shift": "--",
+        "stage": "",
+        "show_percentages": "",
+        "live_agents": "",
+        "time_in_sec": "",
+        "search_archived_data": "",
+        "show_defunct_users": "",
+        "breakdown_by_date": "",
+        "file_download": "1",
+        "SUBMIT": "SUBMIT",
     }
-    if VICI_CAMPAIGN_ID:
-        params["campaign_id"] = VICI_CAMPAIGN_ID
-    if VICI_AGENT_USER:
-        params["agent_user"] = VICI_AGENT_USER
 
-    url = f"{VICI_SERVER}/vicidial/non_agent_api.php"
-    resp = requests.get(url, params=params, timeout=60)
+    url = f"{VICI_SERVER}{REPORT_PATH}"
+    resp = requests.get(
+        url,
+        params=params,
+        auth=HTTPBasicAuth(VICI_API_USER, VICI_API_PASS),
+        timeout=90,
+    )
+
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "ViciDial rejected the credentials (HTTP 401). Double check "
+            "VICI_API_USER / VICI_API_PASS match the sign-in popup exactly."
+        )
     resp.raise_for_status()
-    text = resp.text.strip()
 
-    if text.startswith("ERROR"):
-        raise RuntimeError(f"ViciDial API error: {text}")
+    text = resp.text
+    window_label = f"{query_date} {query_time} -> {end_date} {end_time} ({VICI_TZ.key})"
 
-    # Debug logging: show exactly what came back, so mismatches (wrong
-    # column count, unexpected format, empty response, etc.) are easy to
-    # diagnose from the GitHub Actions run log without guesswork.
-    preview_lines = text.splitlines()[:5]
-    print("---- Raw API response preview (first 5 lines) ----")
+    # Debug logging: first few lines, so any format surprise is visible in
+    # the GitHub Actions run log without guesswork.
+    preview_lines = text.splitlines()[:6]
+    print("---- Raw report response preview (first 6 lines) ----")
     for line in preview_lines:
-        print(repr(line))
+        print(repr(line[:200]))
     print("---- End preview ----")
 
-    if not text:
-        # No agent activity in that window is a valid (if boring) outcome.
-        return pd.DataFrame(), dt_start, dt_end
-
-    all_lines = [line for line in text.splitlines() if line.strip()]
-    all_rows = [line.split("|") for line in all_lines]
-
-    header = all_rows[0]
-    data_rows = all_rows[1:]
-
-    if not data_rows:
-        # Header only, no agent activity in this window.
-        return pd.DataFrame(columns=header), dt_start, dt_end
-
-    # ViciDial can occasionally emit rows with a different field count than
-    # the header (e.g. a trailing blank line, or a totals row). Rather than
-    # crashing, normalize every row to the header's width: pad short rows
-    # with empty strings, truncate long ones, and log a warning either way
-    # so it's visible in the run log if it happens.
-    expected_len = len(header)
-    normalized_rows = []
-    for i, row in enumerate(data_rows):
-        if len(row) != expected_len:
-            print(
-                f"WARNING: row {i} has {len(row)} fields, expected {expected_len} "
-                f"(header={header}); row content: {row}"
-            )
-        if len(row) < expected_len:
-            row = row + [""] * (expected_len - len(row))
-        elif len(row) > expected_len:
-            row = row[:expected_len]
-        normalized_rows.append(row)
-
-    df = pd.DataFrame(normalized_rows, columns=header)
-    return df, dt_start, dt_end
+    return text, query_date + "_" + query_time, end_date + "_" + end_time
 
 
 # --------------------------------------------------------------------------
-# Step 2: Save to Excel
+# Step 2: Parse the double-encoded CSV into a DataFrame
 # --------------------------------------------------------------------------
 
-def build_excel(df: pd.DataFrame, dt_start: str, dt_end: str) -> bytes:
+def _unwrap_row(line: str) -> list[str]:
+    """Undoes the double CSV-encoding used by this report: each raw line is
+    one big quoted CSV field, whose content is itself a normal CSV row."""
+    outer = next(csv.reader([line]), [])
+    if not outer:
+        return []
+    return next(csv.reader([outer[0]]), [])
+
+
+def parse_report(text: str) -> pd.DataFrame:
+    lines = text.splitlines()
+
+    header_idx = None
+    for i, line in enumerate(lines):
+        if "USER NAME" in line:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        # No agents matched the filters/time window — a legitimate, if
+        # uneventful, outcome (e.g. an overnight hour with no logged-in
+        # agents). Return an empty frame rather than failing.
+        print("No 'USER NAME' header row found in the report — treating as no data.")
+        return pd.DataFrame()
+
+    header = _unwrap_row(lines[header_idx])
+
+    rows = []
+    skipped = 0
+    for line in lines[header_idx + 1:]:
+        if not line.strip():
+            continue
+        row = _unwrap_row(line)
+        if len(row) != len(header):
+            skipped += 1
+            continue
+        rows.append(row)
+
+    if skipped:
+        print(f"WARNING: skipped {skipped} malformed row(s) that didn't match the header's column count.")
+
+    return pd.DataFrame(rows, columns=header)
+
+
+# --------------------------------------------------------------------------
+# Step 3: Save to Excel
+# --------------------------------------------------------------------------
+
+def build_excel(df: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Agent Performance Detail")
-        ws = writer.sheets["Agent Performance Detail"]
-        # Auto-width columns roughly based on content length
+        sheet_name = "Agent Performance Detail"
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
         for i, col in enumerate(df.columns, start=1):
             max_len = max([len(str(col))] + [len(str(v)) for v in df[col]]) if len(df) else len(str(col))
             ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max_len + 2, 40)
@@ -173,21 +221,22 @@ def build_excel(df: pd.DataFrame, dt_start: str, dt_end: str) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Step 3: Email the file
+# Step 4: Email the file
 # --------------------------------------------------------------------------
 
-def send_email(xlsx_bytes: bytes, dt_start: str, dt_end: str, row_count: int):
+def send_email(xlsx_bytes: bytes, start_label: str, end_label: str, row_count: int):
     msg = EmailMessage()
-    msg["Subject"] = f"Agent Performance Detail Report ({dt_start} to {dt_end})"
+    msg["Subject"] = f"Agent Performance Detail Report ({start_label} to {end_label})"
     msg["From"] = EMAIL_FROM
     msg["To"] = ", ".join(EMAIL_TO)
     msg.set_content(
-        f"Attached: Agent Performance Detail report for {dt_start} to {dt_end}.\n"
+        f"Attached: Agent Performance Detail report for {start_label} to {end_label}.\n"
         f"{row_count} agent record(s) included.\n\n"
         f"This is an automated message."
     )
 
-    filename = f"agent_performance_detail_{dt_start.replace(':', '').replace('+', '_')}.xlsx"
+    safe_name = f"agent_performance_detail_{start_label}".replace(":", "").replace(" ", "_")
+    filename = f"{safe_name}.xlsx"
     msg.add_attachment(
         xlsx_bytes,
         maintype="application",
@@ -207,14 +256,16 @@ def send_email(xlsx_bytes: bytes, dt_start: str, dt_end: str, row_count: int):
 # --------------------------------------------------------------------------
 
 def main():
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Fetching agent performance data...")
-    df, dt_start, dt_end = fetch_agent_performance()
-    print(f"Fetched {len(df)} row(s) for window {dt_start} -> {dt_end}")
+    print(f"[{datetime.now(VICI_TZ).isoformat()}] Downloading Agent Performance Detail report...")
+    text, start_label, end_label = download_report_text()
 
-    xlsx_bytes = build_excel(df, dt_start, dt_end)
+    df = parse_report(text)
+    print(f"Parsed {len(df)} agent row(s), {len(df.columns) if len(df.columns) else 0} column(s).")
+
+    xlsx_bytes = build_excel(df)
     print("Excel file built, sending email...")
 
-    send_email(xlsx_bytes, dt_start, dt_end, len(df))
+    send_email(xlsx_bytes, start_label, end_label, len(df))
     print("Email sent successfully.")
 
 
