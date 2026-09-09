@@ -178,9 +178,20 @@ def parse_report(text: str) -> pd.DataFrame:
             break
 
     if header_idx is None:
-        # No agents matched the filters/time window — a legitimate, if
-        # uneventful, outcome (e.g. an overnight hour with no logged-in
-        # agents). Return an empty frame rather than failing.
+        # Distinguish "genuinely no agent activity this hour" from "we
+        # didn't get the report at all" (e.g. an auth failure returned a
+        # login page instead). Silently emailing an empty report in the
+        # second case would hide a real problem, so fail loudly instead.
+        lowered = text.lower()
+        looks_like_html_page = "<html" in lowered or "<!doctype html" in lowered
+        if looks_like_html_page:
+            raise RuntimeError(
+                "The response looks like an HTML page (e.g. a login page), "
+                "not the report data. This usually means authentication "
+                "failed or expired. Check VICI_API_USER / VICI_API_PASS, "
+                "and confirm the login method still matches what the "
+                "script expects (see README)."
+            )
         print("No 'USER NAME' header row found in the report — treating as no data.")
         return pd.DataFrame()
 
