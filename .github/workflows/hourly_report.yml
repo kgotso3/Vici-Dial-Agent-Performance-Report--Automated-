@@ -35,7 +35,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          # Optional overrides — remove or edit as needed:
+          # Optional overrides — remove the leading # to use:
           # REPORT_HOURS_BACK: "1"
-          # VICI_CAMPAIGN_ID: "MYCAMP"
+          # VICI_TIMEZONE: "Africa/Johannesburg"
         run: python vici_report.py
