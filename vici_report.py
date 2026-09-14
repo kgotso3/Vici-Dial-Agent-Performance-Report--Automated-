@@ -144,6 +144,19 @@ def establish_session() -> requests.Session:
     session, exactly like a browser that visited admin.php first.
     """
     session = requests.Session()
+    # Some corporate front-ends (WAFs, reverse proxies, security gateways)
+    # block or challenge-page requests that don't look like a real browser.
+    # Python's default User-Agent ("python-requests/x.x") is an easy tell,
+    # so we send headers that match a normal desktop browser.
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
     auth = _detect_auth_and_build(session)
 
     admin_resp = session.get(f"{VICI_SERVER}{ADMIN_PATH}", auth=auth, timeout=60)
@@ -152,6 +165,7 @@ def establish_session() -> requests.Session:
         f"{len(admin_resp.content)} bytes, "
         f"cookies received: {list(session.cookies.keys())}"
     )
+    _debug_dump(admin_resp.text, label="admin.php response")
 
     if admin_resp.status_code == 401:
         raise RuntimeError(
@@ -171,6 +185,19 @@ def establish_session() -> requests.Session:
     # individual page still enforces it independently.
     session.auth = auth
     return session
+
+
+def _debug_dump(text: str, label: str):
+    """Prints enough of a response to identify what page we actually got
+    back — the <title> tag (if any) plus a chunk of the body — so auth or
+    WAF/gateway issues are visible in the log instead of requiring guesswork.
+    """
+    import re
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).strip() if title_match else "(no <title> found)"
+    print(f"---- {label}: <title> = {title!r} ----")
+    print(text[:1500])
+    print(f"---- End {label} (showed first 1500 of {len(text)} chars) ----")
 
 
 def download_report_text() -> tuple[str, str, str]:
@@ -230,13 +257,10 @@ def download_report_text() -> tuple[str, str, str]:
     text = resp.text
     window_label = f"{query_date} {query_time} -> {end_date} {end_time} ({VICI_TZ.key})"
 
-    # Debug logging: first few lines, so any format surprise is visible in
-    # the GitHub Actions run log without guesswork.
-    preview_lines = text.splitlines()[:6]
-    print("---- Raw report response preview (first 6 lines) ----")
-    for line in preview_lines:
-        print(repr(line[:200]))
-    print("---- End preview ----")
+    # Debug logging: title + a real chunk of the body, so any format
+    # surprise (auth failure, WAF block page, etc.) is visible in the
+    # GitHub Actions run log without guesswork.
+    _debug_dump(text, label="report response")
 
     return text, query_date + "_" + query_time, end_date + "_" + end_time
 
