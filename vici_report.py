@@ -54,7 +54,7 @@ from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
 import requests
-from requests.auth import HTTPBasicAuth
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 import pandas as pd
 
 
@@ -67,7 +67,13 @@ def get_required_env(name: str) -> str:
     if not val:
         print(f"ERROR: missing required environment variable: {name}", file=sys.stderr)
         sys.exit(1)
-    return val
+    # Strip stray whitespace/newlines — a very common, hard-to-spot cause of
+    # auth failures when a credential is copy-pasted into a GitHub Secret
+    # with an accidental trailing space or newline.
+    stripped = val.strip()
+    if stripped != val:
+        print(f"NOTE: {name} had leading/trailing whitespace that was stripped.")
+    return stripped
 
 
 VICI_SERVER = get_required_env("VICI_SERVER").rstrip("/")
@@ -85,6 +91,43 @@ REPORT_HOURS_BACK = int(os.environ.get("REPORT_HOURS_BACK", "1"))
 VICI_TZ = ZoneInfo(os.environ.get("VICI_TIMEZONE", "Africa/Johannesburg"))
 
 REPORT_PATH = "/vicidial/AST_agent_performance_detail.php"
+
+
+def _detect_auth_and_build(session: requests.Session):
+    """Probes the report URL without credentials to see exactly what
+    authentication scheme the server demands (Basic, Digest, or NTLM),
+    rather than assuming — these look identical in a browser popup but are
+    sent completely differently over the wire.
+    """
+    try:
+        probe = session.get(f"{VICI_SERVER}{REPORT_PATH}", timeout=30)
+    except requests.RequestException as e:
+        print(f"NOTE: auth-scheme probe request failed ({e}); defaulting to Basic Auth.")
+        return HTTPBasicAuth(VICI_API_USER, VICI_API_PASS)
+
+    www_auth = probe.headers.get("WWW-Authenticate", "")
+    print(f"Auth probe: HTTP {probe.status_code}, WWW-Authenticate: {www_auth!r}")
+
+    scheme = www_auth.split()[0].lower() if www_auth else ""
+
+    if scheme == "digest":
+        print("Server requested Digest authentication.")
+        return HTTPDigestAuth(VICI_API_USER, VICI_API_PASS)
+
+    if scheme in ("ntlm", "negotiate"):
+        try:
+            from requests_ntlm import HttpNtlmAuth
+        except ImportError:
+            raise RuntimeError(
+                "Server requires NTLM/Windows authentication, but the "
+                "'requests-ntlm' package isn't installed. Add "
+                "'requests-ntlm' to requirements.txt to support this."
+            )
+        print("Server requested NTLM authentication.")
+        return HttpNtlmAuth(VICI_API_USER, VICI_API_PASS)
+
+    # Default: plain HTTP Basic Auth (matches a standard browser sign-in popup)
+    return HTTPBasicAuth(VICI_API_USER, VICI_API_PASS)
 
 
 # --------------------------------------------------------------------------
@@ -127,17 +170,23 @@ def download_report_text() -> tuple[str, str, str]:
     }
 
     url = f"{VICI_SERVER}{REPORT_PATH}"
-    resp = requests.get(
+    session = requests.Session()
+    auth = _detect_auth_and_build(session)
+
+    resp = session.get(
         url,
         params=params,
-        auth=HTTPBasicAuth(VICI_API_USER, VICI_API_PASS),
+        auth=auth,
         timeout=90,
     )
+
+    print(f"Report request: HTTP {resp.status_code}, {len(resp.content)} bytes returned")
 
     if resp.status_code == 401:
         raise RuntimeError(
             "ViciDial rejected the credentials (HTTP 401). Double check "
-            "VICI_API_USER / VICI_API_PASS match the sign-in popup exactly."
+            "VICI_API_USER / VICI_API_PASS match the sign-in popup exactly "
+            "(watch for extra spaces when copying into GitHub Secrets)."
         )
     resp.raise_for_status()
 
