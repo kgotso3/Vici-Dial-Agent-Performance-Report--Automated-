@@ -91,22 +91,23 @@ REPORT_HOURS_BACK = int(os.environ.get("REPORT_HOURS_BACK", "1"))
 VICI_TZ = ZoneInfo(os.environ.get("VICI_TIMEZONE", "Africa/Johannesburg"))
 
 REPORT_PATH = "/vicidial/AST_agent_performance_detail.php"
+ADMIN_PATH = "/vicidial/admin.php"
 
 
 def _detect_auth_and_build(session: requests.Session):
-    """Probes the report URL without credentials to see exactly what
+    """Probes the ADMIN LOGIN page (not the report itself) to see what
     authentication scheme the server demands (Basic, Digest, or NTLM),
     rather than assuming — these look identical in a browser popup but are
     sent completely differently over the wire.
     """
     try:
-        probe = session.get(f"{VICI_SERVER}{REPORT_PATH}", timeout=30)
+        probe = session.get(f"{VICI_SERVER}{ADMIN_PATH}", timeout=30)
     except requests.RequestException as e:
         print(f"NOTE: auth-scheme probe request failed ({e}); defaulting to Basic Auth.")
         return HTTPBasicAuth(VICI_API_USER, VICI_API_PASS)
 
     www_auth = probe.headers.get("WWW-Authenticate", "")
-    print(f"Auth probe: HTTP {probe.status_code}, WWW-Authenticate: {www_auth!r}")
+    print(f"Auth probe (admin.php): HTTP {probe.status_code}, WWW-Authenticate: {www_auth!r}")
 
     scheme = www_auth.split()[0].lower() if www_auth else ""
 
@@ -133,6 +134,44 @@ def _detect_auth_and_build(session: requests.Session):
 # --------------------------------------------------------------------------
 # Step 1: Download the report from ViciDial
 # --------------------------------------------------------------------------
+
+def establish_session() -> requests.Session:
+    """Logs into ViciDial's admin panel first, the same way a browser does,
+    so we get the session cookie that the report page actually relies on.
+    Hitting the report URL directly (skipping this step) is what was
+    returning an HTML page instead of report data — the report page isn't
+    itself Basic-Auth protected, it just needs an already-authenticated
+    session, exactly like a browser that visited admin.php first.
+    """
+    session = requests.Session()
+    auth = _detect_auth_and_build(session)
+
+    admin_resp = session.get(f"{VICI_SERVER}{ADMIN_PATH}", auth=auth, timeout=60)
+    print(
+        f"Admin login request: HTTP {admin_resp.status_code}, "
+        f"{len(admin_resp.content)} bytes, "
+        f"cookies received: {list(session.cookies.keys())}"
+    )
+
+    if admin_resp.status_code == 401:
+        raise RuntimeError(
+            "ViciDial rejected the credentials at admin.php (HTTP 401). "
+            "Double check VICI_API_USER / VICI_API_PASS match the sign-in "
+            "popup exactly."
+        )
+    admin_resp.raise_for_status()
+
+    if not session.cookies:
+        print(
+            "WARNING: no cookies were set after logging into admin.php — "
+            "the report request may still fail if it depends on session state."
+        )
+
+    # Keep using the same auth on subsequent requests too, in case any
+    # individual page still enforces it independently.
+    session.auth = auth
+    return session
+
 
 def download_report_text() -> tuple[str, str, str]:
     """Downloads the raw report CSV text for the last REPORT_HOURS_BACK hours."""
@@ -170,13 +209,11 @@ def download_report_text() -> tuple[str, str, str]:
     }
 
     url = f"{VICI_SERVER}{REPORT_PATH}"
-    session = requests.Session()
-    auth = _detect_auth_and_build(session)
+    session = establish_session()
 
     resp = session.get(
         url,
         params=params,
-        auth=auth,
         timeout=90,
     )
 
